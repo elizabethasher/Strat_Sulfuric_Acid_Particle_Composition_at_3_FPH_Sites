@@ -242,51 +242,56 @@ def get_monthly_climatology(df_main, loc, press, remseascyl, varname):
     return climatology
                                  
 
-# Optimized H2SO4 Weight Percent Calculation
-def calc_h2so4_wt_vectorized(T_k, Pw_hpa):
-    """
-    Vectorized calculation of H2SO4 aerosol %wt. Tabazadeh 1997
-    """
-    #Constants
-    Wi = np.linspace(0.1, 0.8, 15)
-    ai = np.array([19.726, 19.747, 19.761, 19.794, 19.883, 20.078, 20.379, 20.637, 20.682, 20.55, 20.405, 20.383, 20.585, 21.169, 21.808])
-    bi = np.array([-4364.8, -4390.9, -4414.7, -4451.1, -4519.2, -4644.0, -4828.5, -5011.5, -5121.3, -5177.6, -5252.1, -5422.4, -5743.8, -6310.6, -6985.9])
-    ci = np.array([-147620, -144690, -142940, -140870, -136500, -127240, -112550, -98811, -94033, -96984, -100840, -97966, -83701, -48396, -12170])
-
-    # Rounding for matching
-    Pw_rounded = np.round(Pw_hpa, decimals=5)
-
-    #Interpolation grid
-    W_grid = np.linspace(0.1, 0.8, 701)
-    a_interp = np.interp(W_grid, Wi, ai)
-    b_interp = np.interp(W_grid, Wi, bi)
-    c_interp = np.interp(W_grid, Wi, ci)
-
-    #Calculate lookup grid for current Temperature
-    pw_calc_grid = np.exp(a_interp + b_interp/T_k + c_interp/T_k**2)
+def Pw_2_H2SO4wt_Tabazadeh1997(T1, Pwa, return_fraction=True):
+# 1. Convert temperature to Kelvin if passed in Celsius
+    T = T1 + 273.15
     
-    #Find closest match
-    idx = np.abs(pw_calc_grid - Pw_rounded).argmin()
-    wt = W_grid[idx]
+    # 2. Saturation vapor pressure over liquid water (P0_H2O) in mbar [Eq. 1]
+    ln_P0_H2O = 18.452406985 - (3505.1578807 / T) - (330918.55082 / (T**2)) + (12725068.262 / (T**3))
+    P0_H2O = np.exp(ln_P0_H2O)
+    
+    # 3. Calculate Water Activity (a_w)
+    aw = Pwa / P0_H2O
+    #aw = np.clip(aw, 0.01, 0.999) # Valid range for Tabazadeh model (0.01 < aw < 1.0)
+    
+    # 4. Determine y1 and y2 based on water activity ranges [Table 2]
+    # Function helper: y(aw) = A * aw^B + C * aw + D
+    def calc_y(aw_val, A, B, C, D):
+        return A * (aw_val**B) + C * aw_val + D
+    
+    # Coefficients for different aw ranges: [A, B, C, D]
+    cond_low = aw <= 0.05
+    cond_mid = (aw > 0.05) & (aw <= 0.85)
+    cond_high = aw > 0.85
+    
+    # Allocate arrays for y1 and y2
+    y1 = np.zeros_like(aw, dtype=float)
+    y2 = np.zeros_like(aw, dtype=float)
+    
+    # Range 1: 0.01 < aw <= 0.05
+    y1 = np.where(cond_low, calc_y(aw, 1.2372089320e+1, -1.6125516114e-1, -3.0490657554e+1, -2.1133114241e+0), y1)
+    y2 = np.where(cond_low, calc_y(aw, 1.3455394705e+1, -1.9213122550e-1, -3.4285174607e+1, -1.7620073078e+0), y2)
+    
+    # Range 2: 0.05 < aw <= 0.85
+    y1 = np.where(cond_mid, calc_y(aw, 1.1820654354e+1, -2.0786404244e-1, -4.8073063730e+0, -5.1727540348e+0), y1)
+    y2 = np.where(cond_mid, calc_y(aw, 1.2891938068e+1, -2.3233847708e-1, -6.4261237757e+0, -4.9005471319e+0), y2)
+    
+    # Range 3: aw > 0.85
+    y1 = np.where(cond_high, calc_y(aw, -1.8006541028e+2, -3.8601102592e-1, -9.3317846778e+1, 2.7388132245e+2), y1)
+    y2 = np.where(cond_high, calc_y(aw, -1.7695814097e+2, -3.6257048154e-1, -9.0469744201e+1, 2.6745509988e+2), y2)
+    
+    # 5. Calculate sulfuric acid molality ms (mol/kg) [Eq. 2]
+    ms = y1 + (T - 190.0)*(y2 - y1)/ 70.0
+    
+    # 6. Convert molality (ms) to H2SO4 weight percentage (wt_s) [Eq. 3]
+    wt_s = (9800.0 * ms) / (98.0 * ms + 1000.0)
+    
+    # handle datatypes
+    if isinstance(T1, (int, float)) and isinstance(Pwa, (int, float)):
+        wt_s = float(wt_s)
+    
+    return (wt_s / 100.0) if return_fraction else wt_s
 
-    # 5. Gmitro & Vermeulen Threshold 
-    if wt >= 0.8:
-        W_GV = np.array([0.80, 0.82, 0.84, 0.86, 0.88, 0.90, 0.91, 0.92, 0.93, 0.94, 0.95, 0.96, 0.97, 0.98])
-        R = 1.98726
-        alpha = np.array([0.0114, 0.0568, 0.1233, 0.0666, -0.0120, -0.0346, -0.0398, -0.0427, -0.0436, -0.0428, -0.0405, -0.0368, -0.0314, -0.024])
-        Cp_298 = np.array([9.77, 10.36, 13.78, 18.96, 22.13, 22.76, 22.30, 21.48, 20.44, 19.32, 18.06, 16.64, 15.05, 13.25])
-        L_298 = np.array([-3475, -4015, -4656, -5319, -5938, -6419, -6627, -6816, -6983, -7139, -7286, -7433, -7574, -7712])
-        F_F0 = np.array([-3090, -3427, -3789, -4167, -4557, -4960, -5165, -5375, -5595, -5830, -6090, -6390, -6741, -7204])
-        
-        A = -3.67340 + 1/R * (Cp_298 - 298.15 * alpha)
-        B = -4143.5 + 1/R * (L_298 - 298.15 * Cp_298 + 298.15**2/2 * alpha)
-        C = 10.24353 + 1/R * (Cp_298 + (F_F0 - L_298) * 1/298.15)
-        D = 0.618943E-3 - alpha/(2 * R)
-        
-        pw_gv = np.exp(A + B/T_k + C*np.log(T_k) + D*T_k)
-        idx_gv = np.abs(pw_gv - Pw_rounded).argmin()
-        wt = W_GV[idx_gv]
-    return wt
 
 def goff_gratch_ice(T):
     """Standard Goff-Gratch formulation over ice (T in Kelvin, returns e_i in hPa)."""
@@ -324,7 +329,8 @@ model_press_levels = [38,  56, 82]
     
 #READ IN DATA & assign datetime & Year values
 root_dir = '/Users/asher/Documents/'
-df_p0_i = pd.read_csv(root_dir + 'AGUAnalysisFiles/balloon_w_press_2026.csv', sep=',', dtype=None, engine='python') #root_dir = '/Users/asher/Documents/'
+#df_p0_i = pd.read_csv(root_dir + 'AGUAnalysisFiles/balloon_w_press_2026.csv', sep=',', dtype=None, engine='python') #root_dir = '/Users/asher/Documents/'
+df_p0_i = pd.read_csv(root_dir + 'AGUAnalysisFiles/balloon_FPH_w_press_AllSites_2026.csv', sep=',', dtype=None, engine='python') 
 df_p0_i['Datetime'] = pd.to_datetime(df_p0_i['Launch'])
 
 #Getting datetime
@@ -338,13 +344,116 @@ df_p0_i['Year'] = df_p0_i['Datetime_M'].dt.year + \
            (365 + df_p0_i['Datetime_M'].dt.is_leap_year.astype(int))
            
 
-#Calculate H2SO4 % Wt & remove NAs
-#H2SO4 calculation vectorized (FAST)    
+#Calculate H2SO4 % Wt   
 df_p0_i['Pw_frostpoint']  = df_p0_i['H2O_ppmv']*1e-6*df_p0_i['Press [hPa]']/(1+ df_p0_i['H2O_ppmv']*1e-6) #algebraicly calculate Pw_frostpoint
-v_lookup = np.vectorize(calc_h2so4_wt_vectorized)
-df_p0_i['H2SO4_%wt_amb'] = v_lookup(df_p0_i['Tcorr_degC'] + 273.15, df_p0_i['Pw_frostpoint']) #e_i in hPa
+
+df_p0_i["H2SO4_%wt_amb"] = Pw_2_H2SO4wt_Tabazadeh1997(
+        df_p0_i["Tcorr_degC"].values,
+        df_p0_i["Pw_frostpoint"].values,
+        return_fraction=True,  # Set to True for fractional weight (0-1)
+)
+
+    
+    
 #clean data
 df_p0 = df_p0_i[(df_p0_i['H2O_ppmv'].notna()) & (df_p0_i['Year'] >= 2004)].copy()
+
+means_p = df_p0.groupby(['Location', 'Pressure [hPa]'])['H2SO4_%wt_amb'].mean().unstack()
+print("Acid Wt Fraction Change (38 hPa - 82 hPa):\n", (means_p[26] - means_p[100])/means_p[26])
+
+
+# -----------------------------------------------------------------------------
+# FIGURE 1: Vertical Profiles of H2O, Temperature, and H2SO4 Weight Fraction
+# -----------------------------------------------------------------------------
+fig1_variables = [
+    {
+        'col': 'H2O_ppmv',
+        'label': 'H$_{2}$O (ppmv)',
+        'levels': np.linspace(3, 15, 25),
+        'cmap': 'viridis',
+        'threshold': [4.0],
+        'colors': ['lightgray']
+    },
+    {
+        'col': 'Tcorr_degC',
+        'label': 'Temp (°C)',
+        'levels': np.linspace(-80, -40, 25),
+        'cmap': 'magma',
+        'threshold': [-65.0],
+        'colors': ['lightgray']
+    },
+    {
+        'col': 'H2SO4_%wt_amb',
+        'label': 'H$_{2}$SO$_{4}$ Weight Fraction',
+        'levels': np.linspace(0.25, 0.85, 25),
+        'cmap': 'plasma',
+        'threshold': [0.39, 0.75],
+        'colors': ['lightgray', 'dimgray']
+    }
+]
+fig1_locations = ['Lauder', 'Hilo', 'Boulder']
+
+fig_1, axes_1 = plt.subplots(nrows=3, ncols=3, figsize=(16, 18), sharex=True, sharey=True)
+plt.subplots_adjust(hspace=0.15, wspace=0.1)
+
+panel_labels = [
+    ['a.', 'b.', 'c.'],
+    ['d.', 'e.', 'f.'],
+    ['g.', 'h.', 'i.']
+]
+
+for col_idx, loc in enumerate(fig1_locations):
+    # Filter by site and pressure bounds (20 to 250 hPa)
+    df_loc = df_p0[(df_p0['Location'] == loc) & 
+                   (df_p0['Pressure [hPa]'] <= 250) & 
+                   (df_p0['Pressure [hPa]'] >= 26)].copy()
+    
+    if loc == 'Hilo':
+        df_loc = df_loc[df_loc['Year'] > 2009]
+        
+    for row_idx, var in enumerate(fig1_variables):
+        ax = axes_1[row_idx, col_idx]
+        
+        # Grid and interpolate across fractional years
+        pivot_df = df_loc.pivot_table(index='Pressure [hPa]', columns='Year', values=var['col'])
+        pivot_df = pivot_df.interpolate(method='linear', axis=1, limit_direction='both')
+        
+        X = pivot_df.columns.values
+        Y = pivot_df.index.values
+        Z = pivot_df.values
+        
+        # Filled contours and colorbar
+        cp = ax.contourf(X, Y, Z, levels=var['levels'], cmap=var['cmap'], extend='both')
+        cbar = fig_1.colorbar(cp, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label(var['label'], fontsize=12)
+        
+        # Highlight threshold contours (4 ppmv, -65°C, 0.39, 0.75)
+        if 'threshold' in var:
+            ax.contour(X, Y, Z, levels=var['threshold'], colors=var['colors'], linestyles='solid', linewidths=1.2, zorder=3)
+
+        # Log pressure scale inverted from 250 to 20 hPa
+        ax.set_yscale('log')
+        ax.set_ylim(250, 20)
+        ax.set_xlim(2004, 2026.5)
+        
+        pres_ticks = [250, 150, 100, 70, 40, 20]
+        ax.yaxis.set_major_locator(ticker.FixedLocator(pres_ticks))
+        ax.yaxis.set_major_formatter(ticker.ScalarFormatter())
+        
+        # Outer headers & labels
+        if row_idx == 0:
+            ax.set_title(f'{loc}', fontsize=16, fontweight='bold')
+        if col_idx == 0:
+            ax.set_ylabel('Pressure (hPa)', fontsize=13)
+        if row_idx == 2:
+            ax.set_xlabel('Year', fontsize=13)
+        
+        # Panel tag in upper left of each plot
+        ax.text(2004.5, 24, panel_labels[row_idx][col_idx], fontsize=16, fontweight='bold', color='black')
+
+fig_1.savefig('/Users/asher/Figure1_H2O_T_H2SO4_Profiles.png', dpi=400, bbox_inches='tight')
+plt.show()
+
 
 mdt_results = []
 mdt_temp_results = []
@@ -367,6 +476,10 @@ for loc in ['Lauder', 'Hilo', 'Boulder']:
         x = subset['Year'].values
         y = subset['H2SO4_%wt_amb'].values
         
+        print(loc)
+        print(press)
+        print(min(y))
+        print(max(y))
         #OLS fit with HAC robust standard errors
         X = sm.add_constant(x)
         ols_model = sm.OLS(y, X).fit()
@@ -511,49 +624,6 @@ for loc in ['Lauder', 'Hilo', 'Boulder']:
             df_p0.loc[subset.index, res_col.replace('Residuals', 'Trend')] = trend
 
 df_means = pd.DataFrame(mean_results)
-
-# target_var = 'H2SO4_%wt_amb' 
-
-# sites = ['Lauder', 'Hilo', 'Boulder']
-# fig, axes = plt.subplots(3, 1, figsize=(18, 6), sharey=True)
-
-# for i, loc in enumerate(sites):
-#     means = []
-#     levels = []
-    
-#     #sort pressure levels 
-#     sorted_press = sorted(plot_press_levels)
-    
-#     for press in sorted_press:
-#         #mask data
-#         mask = (df_p0['Location'] == loc) & (df_p0['Pressure [hPa]'] == press)
-#         subset_y = df_p0[mask][target_var].dropna()
-        
-#         if not subset_y.empty:
-#             means.append(np.mean(subset_y))
-#             levels.append(press)
-    
-#     axes[i].hlines(y=levels, xmin=0, xmax=means, color='gray', alpha=0.5, linewidth=1.5)
-#     axes[i].scatter(means, levels, s=100, color= '#D95F02', edgecolor='black', zorder=3)
-    
-#     #format
-#     axes[i].set_title(f'Site: {loc}', fontsize=14, fontweight='bold')
-#     axes[i].set_ylabel('Pressure Level [hPa]', fontsize=12)
-#     axes[i].grid(axis='y', linestyle='--', alpha=0.4)
-#     axes[i].invert_yaxis()
-#     axes[i].set_xticks([0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 ])
-    
-#     if i == 2:
-#         axes[i].set_xlabel('Mean $H_2SO_4$ Weight Fraction', fontsize=12)
-        
-# axes[0].text(-0.02, 30, 'a.', fontsize=12, fontweight='bold')
-# axes[1].text(-0.02, 30, 'b.', fontsize=12, fontweight='bold')
-# axes[2].text(-0.02, 30, 'c.', fontsize=12, fontweight='bold')
-
-# plt.tight_layout()
-# plt.show()
-
-
 target_var = 'H2SO4_%wt_amb' 
 sites = ['Lauder', 'Hilo', 'Boulder']
 
@@ -592,7 +662,7 @@ for loc in sites:
 
 #formatting
 ax.set_title(f'Mean $H_2SO_4$ Weight Fraction by Pressure and Location', fontsize=14, fontweight='bold')
-ax.set_ylabel('Pressure Level [hPa]', fontsize=12)
+ax.set_ylabel('Pressure Level (hPa)', fontsize=12)
 ax.set_xlabel('Mean $H_2SO_4$ Weight Fraction', fontsize=12)
 ax.grid(axis='both', linestyle='--', alpha=0.4)
 ax.invert_yaxis()
@@ -601,46 +671,9 @@ ax.legend(title="Location")
 plt.tight_layout()
 plt.show()
 
-#plot not used in JGR-A submission
-target_var = 'H2O_ppmv' 
-
-sites = ['Lauder', 'Hilo', 'Boulder']
-fig, axes = plt.subplots(1, 3, figsize=(18, 6), sharey=True)
-
-for i, loc in enumerate(sites):
-    means = []
-    levels = []
-    
-    #sort pressure levels
-    sorted_press = sorted(plot_press_levels)
-    
-    for press in sorted_press:
-        #mask data
-        mask = (df_p0['Location'] == loc) & (df_p0['Pressure [hPa]'] == press)
-        subset_y = df_p0[mask][target_var].dropna()
-        
-        if not subset_y.empty:
-            means.append(np.mean(subset_y))
-            levels.append(press)
-    
-    #plotting
-    axes[i].hlines(y=levels, xmin=0, xmax=means, color='gray', alpha=0.5, linewidth=1.5)
-    axes[i].scatter(means, levels, s=100, color='royalblue', edgecolor='black', zorder=3)
-    
-    # Formatting
-    axes[i].set_title(f'Site: {loc}', fontsize=14, fontweight='bold')
-    axes[i].set_ylabel('Pressure Level [hPa]', fontsize=12)
-    axes[i].grid(axis='y', linestyle='--', alpha=0.4)
-    axes[i].invert_yaxis()
-    
-    if i == 0:
-        axes[i].set_xlabel('Mean $H_2O$ (ppmv)', fontsize=12)
-
-plt.tight_layout()
-plt.show()
 
 
-
+#Figure 5
 #cividis rocket  mako
 colors = mpl.colormaps['cividis'].resampled(len(plot_press_levels))
 fig, (ax1, ax2, ax3) = plt.subplots(1, 3,  figsize=(30, 9), sharey=True)
@@ -655,12 +688,28 @@ for loc in [ 'Lauder', 'Boulder', 'Hilo']:
                 df_p0_s = df_p0[df_p0['Year'] < 2027] #previously 2022
                 h2o_ser  = get_processed_series1(df_p0_s , loc, press, 1, 0, varname='H2O')
                 temp_ser = get_processed_series1(df_p0_s , loc, press, 1, 0, varname='Temp')
-                h2so4_ser= get_processed_series1(df_p0_s , loc, press, 1, 0, varname='H2SO4')                
-                x1_std = temp_ser
+                h2so4_ser= get_processed_series1(df_p0_s , loc, press, 1, 0, varname='H2SO4') 
+                
+                temp_abs_ser = get_processed_series1(df_p0_s , loc, press, 1, 0, varname='Tcorr_degC')
+                h2so4_abs_ser = get_processed_series1(df_p0_s , loc, press, 0, 0, varname='H2SO4_abs') #does not r
+                
+                # #you can comment this out if you want...
+                #extract pre-2022 pure historical background means
+                baseline_idx = h2so4_abs_ser.index[h2so4_abs_ser.index < '2022-01-01']
+                mean_h2so4_baseline = h2so4_abs_ser.loc[baseline_idx].mean()
+                mean_temp_baseline = temp_abs_ser.loc[baseline_idx].mean()
+                
+                #add long-term baseline means back to the seasonal anomalies
+                h2so4_mean_added = h2so4_ser + mean_h2so4_baseline
+                temp_mean_added = temp_ser + mean_temp_baseline
+                
+                x1_std = temp_mean_added
                 x2_std = h2o_ser
-                y_std = h2so4_ser
+                y_std = h2so4_mean_added
                 X = np.column_stack((x1_std, x2_std))
                 df_pairs = pd.DataFrame({'H2SO4': h2so4_ser ,'Temp': temp_ser, 'H2O': h2o_ser})
+                
+
 
                 #OLS regression
                 X = sm.add_constant(X)
@@ -669,6 +718,7 @@ for loc in [ 'Lauder', 'Boulder', 'Hilo']:
                 
                 model_ols = sm.OLS(y_std, X).fit()
                 model_ols1 = sm.OLS(y_std, X1).fit()
+                model_ols2 = sm.OLS(y_std, X2).fit()
 
                 #extract AIC 
                 aic_1 = model_ols.aic
@@ -680,6 +730,7 @@ for loc in [ 'Lauder', 'Boulder', 'Hilo']:
                 
                 b0, b1 = model_ols1.params
                 se_b0, se_b1 = model_ols1.bse
+
                 
                 #eq string
                 sign = "+" if b0 >= 0 else "-"
@@ -694,15 +745,21 @@ for loc in [ 'Lauder', 'Boulder', 'Hilo']:
                 #updated plot 
                 ax.plot(x_range, y_line, color=color1, lw=2.5, 
                         label=f"{press} hPa: {eq_str} (Adj-R²={model_ols1.rsquared_adj:.2f})")#label=f"{press} hPa: {eq_str} (R²={results1.rsquared:.2f})")
-                
-                ax.set_xlabel("Temperature Deviations ($\sigma$ C)", fontsize=16)
+                ax.set_xlabel("Temperature  ($\degree$ C)", fontsize=16)
+
                 if loc == 'Lauder':
-                    ax.set_ylabel("$H_2SO_4$ Fractional Wt Deviations ($\sigma$)", fontsize=16)
+                    ax.set_ylabel("$H_2SO_4$ Fractional Weight ", fontsize=16)
                 ax.set_title(loc)
-                ax.set_ylim([-0.075, 0.075])
+
+                if loc == 'Lauder':
+                    ax.text(-5, 0.75, 'a.', fontsize=16, fontweight='bold')
+                elif loc == 'Hilo':
+                    ax.text(-7, 0.75, 'b.', fontsize=16, fontweight='bold')
+                else:
+                    ax.text(-5, 0.75, 'c.', fontsize=16, fontweight='bold')
                 
-                ax.legend(title="Pressure Level", fontsize='small', loc='upper left', frameon=True)
-                plt.savefig('/Users/asher/Temp_v_H2SO4_STAT5010.png', dpi=400, bbox_inches='tight')
+                ax.legend(title="Pressure Level", fontsize='small', loc='lower right', frameon=True)
+                plt.savefig('/Users/asher/Temp_v_H2SO4_Mean_Added_STAT5010.png', dpi=400, bbox_inches='tight')
             
                 print(press)
                 print(loc)
@@ -711,6 +768,92 @@ for loc in [ 'Lauder', 'Boulder', 'Hilo']:
                 
                 if count >5:
                     print(model_ols1.summary())
+plt.show()
+
+
+# APPENDIX 1, FIGURE 1: Temperature Deviations vs H2SO4 Deviations SLR
+fig_a1, (ax_a1, ax_a2, ax_a3) = plt.subplots(1, 3, figsize=(30, 9), sharey=True)
+ax_a1_map = {'Lauder': ax_a1, 'Hilo': ax_a2, 'Boulder': ax_a3}
+
+for loc in ['Lauder', 'Boulder', 'Hilo']:
+    ax = ax_a1_map[loc]
+    count = 0
+    for press in model_press_levels:
+        df_p0_s = df_p0[df_p0['Year'] < 2027]
+        x_dev = get_processed_series1(df_p0_s, loc, press, 1, 0, varname='Temp')
+        y_dev = get_processed_series1(df_p0_s, loc, press, 1, 0, varname='H2SO4')
+        
+        df_reg = pd.concat([x_dev, y_dev], axis=1).dropna()
+        X_mat = sm.add_constant(df_reg.iloc[:, 0])
+        model_fit = sm.OLS(df_reg.iloc[:, 1], X_mat).fit()
+
+        b0, b1 = model_fit.params
+        sign = "+" if b0 >= 0 else "-"
+        eq_str = f"y={b1:.6f}x{sign}{abs(b0):.6f}"
+
+        color1 = colors(count * 3)
+        ax.scatter(df_reg.iloc[:, 0], df_reg.iloc[:, 1], alpha=0.4, s=15, color=color1, edgecolors='k')
+        x_range = np.linspace(df_reg.iloc[:, 0].min(), df_reg.iloc[:, 0].max(), 100)
+        ax.plot(x_range, b0 + b1 * x_range, color=color1, lw=2.5, 
+                label=f"{press} hPa: {eq_str} (Adj-R²={model_fit.rsquared_adj:.2f})")
+
+        ax.set_xlabel("Temperature Deviations (°C)", fontsize=16)
+        if loc == 'Lauder':
+            ax.set_ylabel("$H_2SO_4$ Fractional Wt Deviations", fontsize=16)
+            ax.text(-5, 0.05, 'a.', fontsize=16, fontweight='bold')
+        elif loc == 'Hilo':
+            ax.text(-7, 0.05, 'b.', fontsize=16, fontweight='bold')
+        else:
+            ax.text(-5, 0.05, 'c.', fontsize=16, fontweight='bold')
+
+        ax.set_title(loc, fontsize=16, fontweight='bold')
+        ax.legend(title="Pressure Level", fontsize='small', loc='lower right', frameon=True)
+        count += 1
+
+plt.savefig(root_dir + 'Appendix1_Fig1_Temp_vs_H2SO4_Deviations.png', dpi=400, bbox_inches='tight')
+plt.show()
+
+
+# APPENDIX 1, FIGURE 3: Water Vapor Deviations vs H2SO4 Deviations SLR
+fig_a3, (ax_w1, ax_w2, ax_w3) = plt.subplots(1, 3, figsize=(30, 9), sharey=True)
+ax_w3_map = {'Lauder': ax_w1, 'Hilo': ax_w2, 'Boulder': ax_w3}
+
+for loc in ['Lauder', 'Boulder', 'Hilo']:
+    ax = ax_w3_map[loc]
+    count = 0
+    for press in model_press_levels:
+        df_p0_s = df_p0[df_p0['Year'] < 2027]
+        x_dev = get_processed_series1(df_p0_s, loc, press, 1, 0, varname='H2O')
+        y_dev = get_processed_series1(df_p0_s, loc, press, 1, 0, varname='H2SO4')
+        
+        df_reg = pd.concat([x_dev, y_dev], axis=1).dropna()
+        X_mat = sm.add_constant(df_reg.iloc[:, 0])
+        model_fit = sm.OLS(df_reg.iloc[:, 1], X_mat).fit()
+
+        b0, b1 = model_fit.params
+        sign = "+" if b0 >= 0 else "-"
+        eq_str = f"y={b1:.6f}x{sign}{abs(b0):.6f}"
+
+        color1 = colors(count * 3)
+        ax.scatter(df_reg.iloc[:, 0], df_reg.iloc[:, 1], alpha=0.4, s=15, color=color1, edgecolors='k')
+        x_range = np.linspace(df_reg.iloc[:, 0].min(), df_reg.iloc[:, 0].max(), 100)
+        ax.plot(x_range, b0 + b1 * x_range, color=color1, lw=2.5, 
+                label=f"{press} hPa: {eq_str} (Adj-R²={model_fit.rsquared_adj:.2f})")
+
+        ax.set_xlabel("Water Vapor Deviations (ppmv)", fontsize=16)
+        if loc == 'Lauder':
+            ax.set_ylabel("$H_2SO_4$ Fractional Wt Deviations", fontsize=16)
+            ax.text(-0.5, 0.05, 'a.', fontsize=16, fontweight='bold')
+        elif loc == 'Hilo':
+            ax.text(-1.0, 0.05, 'b.', fontsize=16, fontweight='bold')
+        else:
+            ax.text(-0.5, 0.05, 'c.', fontsize=16, fontweight='bold')
+
+        ax.set_title(loc, fontsize=16, fontweight='bold')
+        ax.legend(title="Pressure Level", fontsize='small', loc='lower right', frameon=True)
+        count += 1
+
+plt.savefig(root_dir + 'Appendix1_Fig3_WV_vs_H2SO4_Deviations.png', dpi=400, bbox_inches='tight')
 plt.show()
 
 colors = mpl.colormaps['cividis'].resampled(len(plot_press_levels))
@@ -724,6 +867,10 @@ for loc in ['Boulder', 'Hilo', 'Lauder']:
     for i, press in enumerate(plot_press_levels):
         #monthly mean anomalies (mean level at each pressure subtracted)
         h2so4_cycle = get_monthly_climatology(df_p0, loc, press,1, varname='H2SO4')
+        
+        p_mean = df_p0[(df_p0['Location'] == loc) & (df_p0['Pressure [hPa]'] == press)]['H2SO4_%wt_amb'].mean()
+        amp_pct_mean = ((h2so4_cycle.max() - h2so4_cycle.min()) / p_mean) * 100
+        print(f"{loc} {press} hPa Seasonal Amp (% of Mean): {amp_pct_mean:.2f}%")
         
         if h2so4_cycle is not None:
             #plot seasonal anomalies
@@ -755,47 +902,14 @@ ax3.legend(title='Pressure Level', title_fontsize=16, fontsize=16,
 plt.tight_layout()
 plt.show()
 
-#seasonal climatology water vapor (not used in JGR-A submission)
-fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(30, 10), sharey=True)
-ax_map = {'Lauder': ax1, 'Hilo': ax2, 'Boulder': ax3}
-
-for loc in ['Lauder', 'Hilo', 'Boulder']: 
-    ax = ax_map[loc]
-    
-    for i, press in enumerate(plot_press_levels):
-        #monthly mean anomalies
-        h2so4_cycle = get_monthly_climatology(df_p0, loc, press,1, varname='H2O')
-        
-        if h2so4_cycle is not None:
-            #plot seasonal anomalies
-            ax.plot(h2so4_cycle.index, h2so4_cycle.values, 
-                    marker='o', 
-                    markersize=8,
-                    linewidth=2.5, 
-                    color=colors(i), 
-                    label=f'{press} hPa')
-
-    #formatting
-    ax.set_title(f'{loc}: $H_2O$ Seasonal Climatology', fontsize=14, pad=20)
-    ax.set_xlabel('Month', fontsize=16)
-    ax.set_xticks(range(1, 13))
-    ax.set_xticklabels(['J', 'F', 'M', 'A', 'M', 'J', 'J', 'A', 'S', 'O', 'N', 'D'], fontsize=14)
-    ax.grid(True, linestyle=':', alpha=0.7)
-
-ax1.set_ylabel('$H_2SO_4$ Weight Fraction', fontsize=18)
-ax3.legend(title='Pressure Level', title_fontsize=15, fontsize=12, 
-           bbox_to_anchor=(1.05, 1), loc='upper left')
-
-plt.tight_layout()
-plt.show()
-
 
 #calculate ANOVA to compare models
 anova_results = anova_lm(model_ols1, model_ols) #aruments = (full model, reduced model)
 print(anova_results)
 #create ANOVA table
 anova_table = []
-fig, (ax1, ax2, ax3) = plt.subplots(1, 3,  figsize=(30, 9), sharey=True)
+
+#fig, (ax1, ax2, ax3) = plt.subplots(1, 3,  figsize=(30, 9), sharey=True)
 ax_map = {'Lauder': ax1, 'Hilo': ax2, 'Boulder': ax3}
 
 #MSPE Comparison including both 2004 - 2022 and 2022 - 2026 periods
@@ -946,25 +1060,9 @@ for loc in [ 'Lauder', 'Boulder', 'Hilo']:
             del df_train, df_test_pre, df_test_post, df_master_pre, df_master_post, df_master
                             
             
-            #MSPE FIGURE
+            #MSPE ERA FIGURE Figure 7
             print(loc)
             adj_r2 = model_ols2a.rsquared_adj 
-            #MSPE plot
-            means = [np.mean(mspe2_pre), np.mean(mspe1_pre), np.mean(mspe0_pre), np.mean(mspe_a_pre), np.mean(mspe_b_pre)]
-            stderrs = [np.std(mspe2_pre)/np.sqrt(k), np.std(mspe1_pre)/np.sqrt(k), np.std(mspe0_pre)/np.sqrt(k), np.std(mspe_a_pre)/np.sqrt(k), np.std(mspe_b_pre)/np.sqrt(k)]
-            models = ["Interaction MLR", "Additive MLR", "Temp SLR", "Fixed 0.75", "Climatology"]
-            bars = ax.bar(models, means, yerr = stderrs, capsize = 6, color = ['blue', 'firebrick', 'black', 'darkgray', 'purple'], alpha = 0.8)
-            ax.set_yscale('log')
-            if loc == 'Lauder':
-                ax.set_ylabel('Mean Squared Prediction Error')
-            count = count + 1
-            ax.set_title(f"MSPE: {loc}", fontsize = 16)
-            ax.text(0.3, 0.96, f"Interaction (P&T); Adj-R² = {adj_r2: 0.2f}", transform=ax.transAxes, ha='center', fontsize = 15, color = 'gray')
-            ax1.text(1, 0.04, 'a.', fontsize=15, fontweight='bold')
-            ax2.text(1, 0.04, 'b.', fontsize=15, fontweight='bold')
-            ax3.text(1, 0.04, 'c.', fontsize=15, fontweight='bold')
-            
-            #legend based on location
             ax_era = ax_era_map[loc]
             
             #means
@@ -996,7 +1094,7 @@ for loc in [ 'Lauder', 'Boulder', 'Hilo']:
             
             
             
-            #Figure MSPE ERA
+            #Figure MSPE ERA with Deviations Appendix I Figure 2
             ax_era.bar(x_locs - b_width/2, means_pre, b_width, yerr=stderrs_pre, capsize=6,
                        label=label_pre, color='gray', edgecolor='black', alpha=0.85)
             ax_era.bar(x_locs + b_width/2, means_post, b_width, yerr=stderrs_post, capsize=6,
@@ -1005,10 +1103,10 @@ for loc in [ 'Lauder', 'Boulder', 'Hilo']:
             ax_era.set_yscale('log')
             ax_era.set_xticks(x_locs)
             ax_era.set_xticklabels(era_models, fontsize=15)
-            ax_era.set_title(f"MSPE Era Comparison: {loc}", fontsize=16, fontweight='bold')
+            ax_era.set_title(f"Deviations MSPE Era Comparison: {loc}", fontsize=16, fontweight='bold')
             ax_era.grid(True, which="both", linestyle=":", alpha=0.5)
             ax_era.legend(loc='upper right')
-            ax_era.text(0.01, 0.95, f"Interaction (P&T); Adj-R² = {adj_r2: 0.2f}", transform=ax.transAxes, ha='center', fontsize = 16, color = 'gray')
+            ax_era.text(0.01, 0.95, f"Interaction (P&T); Adj-R² = {adj_r2: 0.2f}", transform=ax_era.transAxes, ha='center', fontsize = 16, color = 'gray')
             
             ax_e1.text(0.2, 0.01, 'a.', fontsize=15, fontweight='bold')
             ax_e2.text(0.2, 0.01, 'b.', fontsize=15, fontweight='bold')
@@ -1048,7 +1146,7 @@ for loc in [ 'Lauder', 'Boulder', 'Hilo']:
             ax_era_ma.set_xticks(x_locs)
             ax_era_ma.set_xticklabels(ma_models, fontsize=15)
 
-            ax_era_ma.set_title(f"Mean-Added MSPE: {loc}", fontsize=16, fontweight='bold', pad=15)
+            ax_era_ma.set_title(f"MSPE Era Comparison: {loc}", fontsize=16, fontweight='bold', pad=15)
             ax_era_ma.grid(True, which="both", linestyle="--", alpha=0.4)
             ax_era_ma.legend(loc='upper right', fontsize=16, frameon=True)
             ax_m1.text(0.2, 0.01, 'a.', fontsize=15, fontweight='bold')
@@ -1067,39 +1165,49 @@ for loc in [ 'Lauder', 'Boulder', 'Hilo']:
             anova_table.append({'Site': loc, 'Comparison': 'Temp SLR vs. Additive T&P ANCOVA', 'DF Difference': res0['df_diff'], 'SSE Difference': res0['ss_diff'], 'F-stat': res0['F'], 'P-value': res0['Pr(>F)']})
             anova_table.append({'Site': loc, 'Comparison': 'Temp SLR vs. Interaction T&P MLR', 'DF Difference': res1['df_diff'], 'SSE Difference': res1['ss_diff'], 'F-stat': res1['F'], 'P-value': res1['Pr(>F)']})
             anova_table_final = pd.DataFrame(anova_table) #this is table 1 in the paper
-            print(model_ols2a.summary()) #this summary goes into a table in the appendix
+            #print(model_ols2a.summary()) #this summary goes into table 2 in the appendix
+            print(model_ols2_ma.summary())#this summary goes into table 2 in the appendix
             
             #NEW ANOVA table for added means
             anova_results0_ma = anova_lm(model_ols0a_ma, model_ols1a_ma)
-            anova_results1_ma = anova_lm(model_ols0a_ma, model_ols2a_ma)
+            anova_results1_ma = anova_lm(model_ols1a_ma, model_ols2a_ma)
             
             print(f"\n================= MEAN-ADDED MODEL AUDIT ({loc}) =================")
             print("Comparison: Temp SLR vs. Additive Mean-Added ANCOVA")
             print(anova_results0_ma)
-            print("\nComparison: Temp SLR vs. Interaction Mean-Added MLR")
+            print("\nComparison: Additive Mean-Added ANCOVA vs. Interaction Mean-Added MLR")
             print(anova_results1_ma)
             print("==========================================================================")
             
+            print(f"\n================= MEAN-REMOVED MODEL AUDIT ({loc}) =================")
+            print("Comparison: Temp SLR vs. Additive Mean-Added ANCOVA")
+            print(anova_results0)
+            print("\nComparison: Temp SLR vs. Interaction Mean-Added MLR")
+            print(anova_results1)
+            print("==========================================================================")
+            
             #Get residuals, fitted values and standardize Residuals
-            resids = model_ols2a.resid
-            fitted = model_ols2a.fittedvalues
+            #resids = model_ols2a.resid
+            #fitted = model_ols2a.fittedvalues
+            resids = model_ols2_ma.resid
+            fitted = model_ols2_ma.fittedvalues
             std_resid = (resids - np.mean(resids)) / np.std(resids)
             
             #Durbin Watson test to print on Diagnostics plots 
             stat = durbin_watson(resids) #printed on the residuals vs. fitted plot...looking if model assumptions are met
                 
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+            fig_diag, (ax_qq, ax_res) = plt.subplots(1, 2, figsize=(16, 6))
             #Diagnostic Q-Q Plot
-            stats.probplot(std_resid, dist="norm", plot=ax1)
-            ax1.set_title(f"Q-Q Plot Full Model {loc}")
-            ax1.grid(True, alpha=0.3)
-            ax2.scatter(fitted, std_resid, alpha = 0.5)
-            ax2.axhline(0, color = 'red')
-            ax2.set_title(f"Fitted vs. Residuals Plot {loc}")
-            ax2.set_xlabel('Fitted Values')
-            ax2.set_ylabel('Standardized Residuals')
-            ax2.grid(True, alpha=0.3)
-            ax2.text(0.6, 0.075, f" Durbin Watson Statistic = {stat: .1f}", transform=ax2.transAxes, ha='center', fontsize = 15, color = 'gray')
+            stats.probplot(std_resid, dist="norm", plot=ax_qq)
+            ax_qq.set_title(f"Q-Q Plot Full Model {loc}")
+            ax_qq.grid(True, alpha=0.3)
+            ax_res.scatter(fitted, std_resid, alpha = 0.5)
+            ax_res.axhline(0, color = 'red')
+            ax_res.set_title(f"Fitted vs. Residuals Plot {loc}")
+            ax_res.set_xlabel('Fitted Values')
+            ax_res.set_ylabel('Standardized Residuals')
+            ax_res.grid(True, alpha=0.3)
+            ax_res.text(0.6, 0.075, f" Durbin Watson Statistic = {stat: .1f}", transform=ax_res.transAxes, ha='center', fontsize = 15, color = 'gray')
 
 plt.tight_layout()
 plt.show()
@@ -1182,18 +1290,26 @@ df_p0['sigma_e'] = np.abs(df_p0['dF_dT']) * sigma_T_fph
 df_p0['sigma_Tamb'] = 0.5  #maximum uncertainty in radiosonde temperature
 
 #bounds of errors
-T_actual_K = df_p0['Tcorr_degC'].values + 273.15
+T_actual_C = df_p0['Tcorr_degC'].values #T_actual_K = df_p0['Tcorr_degC'].values + 273.15
 e_actual = df_p0['Pw_frostpoint'].values
 
-T_plus  = T_actual_K + df_p0['sigma_Tamb'].values
-T_minus = T_actual_K - df_p0['sigma_Tamb'].values
+T_plus  = T_actual_C + df_p0['sigma_Tamb'].values
+T_minus = T_actual_C - df_p0['sigma_Tamb'].values
 e_plus  = np.maximum(1e-6, e_actual + df_p0['sigma_e'].values)  
 e_minus = np.maximum(1e-6, e_actual - df_p0['sigma_e'].values)
 
-w1 = v_lookup(T_plus,  e_plus)
-w2 = v_lookup(T_plus,  e_minus)
-w3 = v_lookup(T_minus, e_plus)
-w4 = v_lookup(T_minus, e_minus)
+#w1 = v_lookup(T_plus,  e_plus)
+#w2 = v_lookup(T_plus,  e_minus)
+#w3 = v_lookup(T_minus, e_plus)
+#w4 = v_lookup(T_minus, e_minus)
+
+w1 = Pw_2_H2SO4wt_Tabazadeh1997(T_plus, e_plus, return_fraction=True)
+w2 = Pw_2_H2SO4wt_Tabazadeh1997(T_plus, e_minus, return_fraction=True)
+w3 = Pw_2_H2SO4wt_Tabazadeh1997(T_minus, e_plus, return_fraction=True)
+w4 = Pw_2_H2SO4wt_Tabazadeh1997(T_minus, e_minus, return_fraction=True)
+    
+    
+
 
 w_combos = np.column_stack([w1, w2, w3, w4])
 df_p0['W_max'] = np.max(w_combos, axis=1)
@@ -1203,6 +1319,10 @@ df_p0['W_min'] = np.min(w_combos, axis=1)
 df_p0['Unc_Positive'] = df_p0['W_max'] - df_p0['H2SO4_%wt_amb']
 df_p0['Unc_Negative'] = df_p0['H2SO4_%wt_amb'] - df_p0['W_min']
 
+#print out median at ach site  uncertainty 
+p_sub = df_p0[(df_p0['Pressure [hPa]'] >= 26) & (df_p0['Pressure [hPa]'] <= 100)]
+for loc, grp in p_sub.groupby('Location'):
+    print(f"{loc} -> 95th Pct +Unc: {grp['Unc_Positive'].quantile(0.95):.4f} | 95th Pct -Unc: {grp['Unc_Negative'].quantile(0.95):.4f}")
 
 df_p0.loc[df_p0['Pressure [hPa]'] < 26, 'Unc_Positive'] = np.nan
 df_p0.loc[df_p0['Pressure [hPa]'] < 26, 'Unc_Negative'] = np.nan
@@ -1284,14 +1404,20 @@ for row_idx in range(2):
         
         ax.grid(True, which='both', linestyle=':', alpha=0.4, color='gray')
         
-        if col_idx == 0:
-            ax.set_ylabel('Pressure [hPa]', fontsize=20)
+        if ((col_idx == 0) & (row_idx == 0)):
+            ax.set_ylabel('Pressure (hPa)', fontsize=20)
             ax.text(2005, 25, 'a.', fontsize=22, fontweight='bold')
-        elif col_idx == 1:
+        elif (col_idx == 1) & ((row_idx == 0)):
             ax.text(2005, 25, 'b.', fontsize=22, fontweight='bold')
-        else:
+        elif (col_idx == 2) & ((row_idx == 0)):
             ax.text(2005, 25, 'c.', fontsize=22, fontweight='bold')
-
+        elif (col_idx == 0) & ((row_idx == 1)):
+            ax.set_ylabel('Pressure (hPa)', fontsize=20)
+            ax.text(2005, 25, 'd.', fontsize=22, fontweight='bold')
+        elif (col_idx == 1) & ((row_idx == 1)):
+            ax.text(2005, 25, 'e.', fontsize=22, fontweight='bold')
+        else:
+            ax.text(2005, 25, 'f.', fontsize=22, fontweight='bold')
 fig_unc.tight_layout()
 fig_unc.savefig('/Users/asher/H2SO4_Asymmetric_Uncertainty_Profiles.png', dpi=400, bbox_inches='tight')
 plt.show()
